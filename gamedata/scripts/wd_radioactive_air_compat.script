@@ -1,0 +1,116 @@
+-- WearableDevices v0.8.10 / Radioactive air by Breaker_oak v1.4.
+-- Observe upstream consumption; never modify its equipment or saved state.
+local installed = false
+local samples = {}
+
+local function reset()
+    samples = {}
+end
+
+local function equipped(kind)
+    if not (db and db.actor) then return nil end
+    -- v1.4 only assigns four table references here; this does not save to disk.
+    -- Obtain fresh references because load_state replaces the upstream tables.
+    local state = {}
+    toxic_air.save_state(state)
+    local outfit = db.actor:item_in_slot(7)
+    local helmet = db.actor:item_in_slot(12)
+    local outfit_id = outfit and outfit:id()
+    if kind == "tank" then
+        if not toxic_air.tanks_equipment() then return nil end
+        return state.tanks and state.tanks[outfit_id], outfit_id
+    end
+    local filters = state.filters or {}
+    if filters[outfit_id] then return filters[outfit_id], outfit_id end
+    local helmet_id = helmet and helmet:id()
+    return filters[helmet_id], helmet_id
+end
+
+local function valid(entry)
+    return entry and type(entry.cond) == "number" and entry.cond == entry.cond
+        and entry.cond >= 0 and entry.cond <= 1
+end
+
+local function observe(kind, entry, id, before)
+    local after, after_id = equipped(kind)
+    if not valid(after) or after ~= entry or id ~= after_id then
+        samples[kind] = nil
+        return
+    end
+    samples[kind] = {
+        entry = after, id = after_id, condition = after.cond,
+        hit = math.max(0, before - after.cond),
+    }
+end
+
+local function wrap(name, kind)
+    local original = toxic_air[name]
+    toxic_air[name] = function(...)
+        local entry, id = equipped(kind)
+        local before = valid(entry) and entry.cond
+        -- Tail-position varargs preserve all original returns, including nils.
+        local function finish(...)
+            if before then
+                observe(kind, entry, id, before)
+            else
+                samples[kind] = nil
+            end
+            return ...
+        end
+        return finish(original(...))
+    end
+end
+
+local function source_for(kind)
+    local entry, id = equipped(kind)
+    if not valid(entry) then
+        samples[kind] = nil
+        return nil
+    end
+    local sample = samples[kind]
+    if sample and (sample.entry ~= entry or sample.id ~= id
+        or entry.cond > sample.condition) then
+        samples[kind] = nil
+        sample = nil
+    end
+    local hit = sample and sample.hit or 0
+    -- WD needs hit > 0 to display 00:00 in dynamic mode. At zero capacity
+    -- this is an empty-source marker, not a fabricated consumption estimate.
+    -- It also handles loading a save with an already exhausted retained source.
+    if entry.cond == 0 then hit = hit > 0 and hit or 1 end
+    return { kind = kind, cond = entry.cond, hit = hit }
+end
+
+local function get_air_source()
+    local filter = source_for("filter")
+    local tank = source_for("tank")
+    -- Same source preference as WD's native adapter, including empty filters.
+    if filter and (filter.hit > 0 or not (tank and tank.hit > 0)) then
+        return filter
+    end
+    return tank
+end
+
+function on_game_start()
+    if installed then return end
+    if not (wd_toxic and toxic_air
+        and type(toxic_air.save_state) == "function"
+        and type(toxic_air.filter_cond_prot) == "function"
+        and type(toxic_air.tank_cond_prot) == "function"
+        and type(toxic_air.tanks_equipment) == "function") then
+        printf("[WD RadioactiveAir compat] Required APIs missing; adapter disabled.")
+        return
+    end
+    -- Respect a native implementation or another integration's ownership.
+    if toxic_air.get_air_source then
+        printf("[WD RadioactiveAir compat] Existing get_air_source retained; adapter disabled.")
+        return
+    end
+    wrap("filter_cond_prot", "filter")
+    wrap("tank_cond_prot", "tank")
+    toxic_air.get_air_source = get_air_source
+    RegisterScriptCallback("load_state", reset)
+    RegisterScriptCallback("actor_on_net_destroy", reset)
+    RegisterScriptCallback("on_before_level_changing", reset)
+    installed = true
+end
